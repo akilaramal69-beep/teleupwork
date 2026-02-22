@@ -115,13 +115,7 @@ async def fetch_ytdlp_info(url: str) -> dict:
 
     def _fetch():
         try:
-            opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "skip_download": True,
-                # Use iOS client — bypasses YouTube bot detection for format lists
-                "extractor_args": {"youtube": {"player_client": ["ios", "web"]}},
-            }
+            opts = {"quiet": True, "no_warnings": True, "skip_download": True}
             if Config.YT_COOKIES_FILE:
                 opts["cookiefile"] = Config.YT_COOKIES_FILE
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -164,7 +158,6 @@ async def download_ytdlp(
     os.makedirs(out_dir, exist_ok=True)
 
     is_mp3 = quality == "mp3"
-    is_audio_only = quality == "audio"
 
     # Build a safe output stem from the user-chosen filename
     safe_stem = re.sub(r'[\\/*?"<>|:]', "_", os.path.splitext(filename)[0])[:190]
@@ -190,108 +183,74 @@ async def download_ytdlp(
             )
             asyncio.run_coroutine_threadsafe(_safe_edit(progress_msg, text), loop)
 
-    # ── Build format list (ytdlbot strategy) ─────────────────────────────────
-    # Key insight from ytdlbot: use a LIST of formats and retry on each, rather
-    # than relying on yt-dlp's "/" fallback which fails if ALL alternatives fail.
-    # Also exclude vp09/av01 — Telegram cannot stream those codecs.
+    # Build format string — 3-level fallback so something always matches
+    is_mp3 = quality == "mp3"
+    is_audio_only = quality == "audio"
 
     if is_mp3:
-        format_list = ["bestaudio[ext=m4a]", "bestaudio[ext=mp3]", "bestaudio"]
+        format_str = "bestaudio/best"
         postprocessors = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
     elif is_audio_only:
-        format_list = ["bestaudio[ext=m4a]", "bestaudio[ext=mp3]", "bestaudio"]
+        # Download best audio in its native codec — no re-encoding, no merge needed
+        format_str = "bestaudio/best"
         postprocessors = []
     else:
-        height = QUALITY_HEIGHT_MAP.get(quality)   # None means "best"
-        h = height or 1080
-
-        # Formats ordered from most to least preferred (ytdlbot approach):
-        # 1. H.264 mp4 + AAC m4a — Telegram-streamable, exact height
-        # 2. Any AVC + any mp4a acodec — slightly looser
-        # 3. Any video at that height
-        # 4. Pure best — last resort (no height constraint)
-        format_list = [
-            f"bestvideo[ext=mp4][vcodec!*=av01][vcodec!*=vp09][height<={h}]"
-            f"+bestaudio[ext=m4a]",
-            f"bestvideo[vcodec^=avc][height<={h}]"
-            f"+bestaudio[acodec^=mp4a]/best[vcodec^=avc][height<={h}]/best[height<={h}]",
-            "bestvideo[ext=mp4][vcodec!*=av01][vcodec!*=vp09]+bestaudio[ext=m4a]",
-            "bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/best[vcodec^=avc]/best",
-            None,   # let yt-dlp decide with no format constraint
-        ]
+        height = QUALITY_HEIGHT_MAP.get(quality, 1080)
+        if height:
+            # 1. DASH video at requested height + best audio
+            # 2. best DASH video+audio at any height
+            # 3. best combined single-stream as last resort
+            format_str = f"bv[height<={height}]+ba/bv+ba/b"
+        else:  # "best" — no height cap
+            format_str = "bv+ba/b"
         postprocessors = []
 
-    # ── Base ydl_opts (ytdlbot-style reliability settings) ───────────────────
     ydl_opts: dict = {
+        "format": format_str,
         "outtmpl": outtmpl,
         "progress_hooks": [_progress_hook],
-        "quiet": False,
-        "no_warnings": False,
+        "quiet": True,
+        "no_warnings": True,
         "overwrites": True,
         "noplaylist": True,
         "max_filesize": Config.MAX_FILE_SIZE,
-        "check_formats": False,       # don't pre-probe URLs — server IPs get 403
-        "concurrent_fragment_downloads": 16,
-        "buffersize": 4_194_304,      # 4 MB buffer
-        "retries": 6,
-        "fragment_retries": 6,
-        "skip_unavailable_fragments": True,
     }
+    # Only set merge_output_format for video downloads
     if not is_mp3 and not is_audio_only:
         ydl_opts["merge_output_format"] = "mp4"
     if postprocessors:
         ydl_opts["postprocessors"] = postprocessors
     if Config.YT_COOKIES_FILE:
         ydl_opts["cookiefile"] = Config.YT_COOKIES_FILE
-    # PO Token — the real fix for server-IP YouTube downloads (ytdlbot approach)
-    if Config.YT_POTOKEN:
-        ydl_opts["extractor_args"] = {
-            "youtube": [f"po_token=web+{Config.YT_POTOKEN}", "player-client=web,default"]
-        }
-    else:
-        ydl_opts["extractor_args"] = {
-            "youtube": {"player_client": ["ios", "android", "tv_embedded", "web"]}
-        }
 
     def _run() -> str:
-        last_err = None
-        for fmt in format_list:
-            try:
-                opts = dict(ydl_opts)
-                if fmt is not None:
-                    opts["format"] = fmt
-                logging.info("yt-dlp trying format: %s", fmt)
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    ydl.download([url])
-                # Find the downloaded file
-                if is_mp3:
-                    expected_ext = ".mp3"
-                elif is_audio_only:
-                    expected_ext = None
-                else:
-                    expected_ext = ".mp4"
-                if expected_ext:
-                    expected_path = os.path.join(out_dir, f"{safe_stem}{expected_ext}")
-                    if os.path.exists(expected_path):
-                        return expected_path
-                # Fallback: largest file in out_dir starting with the stem
-                candidates = sorted(
-                    [f for f in os.listdir(out_dir) if f.startswith(safe_stem)],
-                    key=lambda f: os.path.getsize(os.path.join(out_dir, f)),
-                    reverse=True,
-                )
-                if candidates:
-                    return os.path.join(out_dir, candidates[0])
-            except Exception as e:
-                logging.warning("yt-dlp format %r failed: %s", fmt, e)
-                last_err = e
-                continue
-        raise last_err or FileNotFoundError("yt-dlp: all formats failed")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.extract_info(url, download=True)
+            # Determine expected extension
+            if is_mp3:
+                expected_ext = ".mp3"
+            elif is_audio_only:
+                expected_ext = None   # yt-dlp chooses (m4a, opus, etc.)
+            else:
+                expected_ext = ".mp4"
 
+            if expected_ext:
+                expected_path = os.path.join(out_dir, f"{safe_stem}{expected_ext}")
+                if os.path.exists(expected_path):
+                    return expected_path
+            # Fallback: largest file starting with the stem
+            candidates = sorted(
+                [f for f in os.listdir(out_dir) if f.startswith(safe_stem)],
+                key=lambda f: os.path.getsize(os.path.join(out_dir, f)),
+                reverse=True,
+            )
+            if candidates:
+                return os.path.join(out_dir, candidates[0])
+            raise FileNotFoundError("yt-dlp: output file not found after download")
 
     file_path = await loop.run_in_executor(None, _run)
     if is_mp3:
